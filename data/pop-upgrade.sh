@@ -155,62 +155,7 @@ install_packages () {
         done
 }
 
-apt_install_prereq () {
-    local packages=($(candidate libc6) $(candidate libmount1) $(candidate zlib1g))
-
-    if package_exists libc6:i386; then
-        packages+=($(candidate libc6:i386))
-    fi
-
-    if package_exists libc++1; then
-        packages+=($(candidate libc++1))
-    fi
-
-    if package_exists libc++1:i386; then
-        packages+=($(candidate libc++1:i386))
-    fi
-
-    if package_exists libmount1:i386; then
-        packages+=($(candidate libmount1:i386))
-    fi
-    
-    if package_exists libselinux1:i386; then
-        packages+=($(candidate libselinux1:i386))
-    fi
-
-    if ! grep 18.04 /etc/os-release; then
-        packages+=($(candidate libglib2.0-0) $(candidate ppp) \
-            $(candidate network-manager) $(candidate libnm0) \
-            $(candidate libosmesa6))
-
-        if package_exists mailcap; then
-            packages+=($(candidate mailcap))
-        fi
-
-        if package_exists libosmesa6:i386; then
-            packages+=($(candidate libosmesa6:i386))
-        fi
-
-        if package_exists libglapi-mesa:i386; then
-            packages+=($(candidate libglapi-mesa:i386))
-        fi
-
-        if package_exists libglib2.0-0:i386; then
-            packages+=($(candidate libglib2.0-0:i386) $(candidate libpcre3:i386))
-        fi
-    fi
-
-    message -i "Installing Prequisites: ${packages}"
-    install_packages ${packages[@]}
-}
-
 upgrade () {
-    if ! grep 18.04 /etc/os-release; then
-        apt-mark minimize-manual -y
-    fi
-
-    apt_install_prereq
-    dpkg_configure
     apt_install_fix
     apt_full_upgrade
 }
@@ -239,29 +184,43 @@ attempt_upgrade () {
     if (upgrade || attempt_repair); then
         rm -rf  /system-update "$1"
 
+        if test "$(grep VERSION_ID= /etc/os-release | cut -d '"' -f 2)" = "24.04"; then
+            # Set cosmic-greeter as the default display manager
+            rm -f /etc/systemd/system/display-manager.service
+            ln -sf /lib/systemd/system/cosmic-greeter.service /etc/systemd/system/display-manager.service
+        fi
+
         message -i "Upgrade complete. Removing old kernels..."
         apt remove linux-image-*hwe*
 
         message -i "Upgrade complete. Autoremoving old packages..."
         apt-get autoremove -y
 
+        apt-mark minimize-manual -y
+        if test "$(grep VERSION_ID= /etc/os-release | cut -d '"' -f 2)" = "24.04"; then
+            message -i "Upgrade complete. Replacing GNOME..."
+            apt-get remove --autoremove -y ~nlanguage-pack-gnome ~ngnome-user-docs gdm3 gnome-bluetooth gnome-calendar \
+                gnome-contacts gnome-online-miners gnome-orca gnome-shell ~ngnome-shell-extension gnome-themes-standard \
+                gnome-tweaks gnome-control-center gnome-online-accounts-gtk+
+        fi
+
         message -i "Upgrade complete. Updating initramfs for all kernels..."
         update-initramfs -c -k all
         plymouth system-update --progress="100"
 
         efi_rename
-        message -i "Upgrade complete. Now rebooting..."
-
-        sleep 6
+        message -i "Upgrade complete. Preparing to reboot..."
+        rm -f /etc/systemd/system/{acpid,pop-upgrade}.service
         sync
-
-        systemctl unmask acpid pop-upgrade
+        sleep 3
+        message -i "Upgrade complete. Now rebooting..."
+        sleep 2
         systemctl reboot
     else
-        message -f "Upgrade failed. Restarting the system to try again..."
-        sleep 6
+        rm -f /etc/systemd/system/{acpid,pop-upgrade}.service
         sync
-        systemctl unmask acpid pop-upgrade
+        message -f "Upgrade failed. Restarting the system to try again..."
+        sleep 5
         systemctl rescue
     fi
 }

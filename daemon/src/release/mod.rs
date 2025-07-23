@@ -18,15 +18,14 @@ use crate::{
     repair::{self, RepairError},
 };
 
+use crate::ubuntu_version::{Codename, Version};
 use anyhow::Context;
 use apt_cmd::{
     lock::apt_lock_wait, request::Request as AptRequest, AptGet, AptMark, AptUpgradeEvent, Dpkg,
     DpkgQuery,
 };
-use async_shutdown::Shutdown;
-
+use async_shutdown::ShutdownManager as Shutdown;
 use futures::prelude::*;
-
 use std::{
     collections::HashSet,
     convert::TryFrom,
@@ -36,8 +35,6 @@ use std::{
     sync::Arc,
 };
 use systemd_boot_conf::SystemdBootConf;
-
-use ubuntu_version::{Codename, Version};
 
 pub const STARTUP_UPGRADE_FILE: &str = "/pop-upgrade";
 
@@ -145,15 +142,16 @@ pub enum UpgradeEvent {
     InstallingPackages = 4,
     UpdatingSourceLists = 5,
     FetchingPackagesForNewRelease = 6,
-    AttemptingLiveUpgrade = 7,
-    AttemptingSystemdUnit = 8,
-    AttemptingRecovery = 9,
-    Success = 10,
-    SuccessLive = 11,
-    Failure = 12,
-    AptFilesLocked = 13,
-    RemovingConflicts = 14,
-    Simulating = 15,
+    FetchingAdditionalPackagesForNewRelease = 7,
+    AttemptingLiveUpgrade = 8,
+    AttemptingSystemdUnit = 9,
+    AttemptingRecovery = 10,
+    Success = 11,
+    SuccessLive = 12,
+    Failure = 13,
+    AptFilesLocked = 14,
+    RemovingConflicts = 15,
+    Simulating = 16,
 }
 
 impl From<UpgradeEvent> for &'static str {
@@ -169,7 +167,8 @@ impl From<UpgradeEvent> for &'static str {
             }
             UpgradeEvent::Failure => "an error occurred while setting up the release upgrade",
             UpgradeEvent::FetchingPackages => "fetching updated packages for the current release",
-            UpgradeEvent::FetchingPackagesForNewRelease => "fetching packages for the new release",
+            UpgradeEvent::FetchingPackagesForNewRelease => "fetching updated packages for the new release",
+            UpgradeEvent::FetchingAdditionalPackagesForNewRelease => "fetching additional packages for the new release",
             UpgradeEvent::InstallingPackages => {
                 "ensuring that system-critical packages are installed"
             }
@@ -186,7 +185,7 @@ impl From<UpgradeEvent> for &'static str {
 
 /// Get a list of APT URIs to fetch for this operation, and then fetch them.
 pub async fn apt_fetch(
-    shutdown: Shutdown,
+    shutdown: Shutdown<()>,
     mut uris: HashSet<AptRequest, std::collections::hash_map::RandomState>,
     func: &dyn Fn(FetchEvent),
 ) -> RelResult<()> {
@@ -236,7 +235,7 @@ pub async fn apt_fetch(
 }
 
 async fn apt_fetch_(
-    shutdown: Shutdown,
+    shutdown: Shutdown<()>,
     uris: HashSet<AptRequest, std::collections::hash_map::RandomState>,
     func: &dyn Fn(FetchEvent),
 ) -> Result<HashSet<AptRequest, std::collections::hash_map::RandomState>, ReleaseError> {
@@ -472,7 +471,7 @@ pub async fn upgrade<'a>(
     release_upgrade(logger, from, to).await.map_err(ReleaseError::Check)?;
 
     // Update lists and fetch packages for the new release.
-    fetch_new_release_packages(logger, fetch, from).await?;
+    fetch_new_release_packages(logger, fetch, from, to).await?;
 
     // Remove packages that are orphaned in the new release
 
@@ -508,9 +507,38 @@ async fn downgrade_packages() -> Result<(), ReleaseError> {
 
     cmd.arg("install");
 
-    for (package, version) in downgradable {
+    'downgrades: for (package, version) in &downgradable {
         if package.contains("pop-upgrade") || package.contains("pop-system-updater") {
             continue;
+        }
+        
+        // Papirus's elementary variant must be removed prior to downgrading the main package.
+        if package.contains("papirus-icon-theme") {
+            info!("papirus-icon-theme will be downgraded, so removing epapirus-icon-theme");
+            let mut remove_epapirus_cmd = AptGet::new().allow_downgrades().force().noninteractive();
+            remove_epapirus_cmd.arg("remove");
+            remove_epapirus_cmd.arg("epapirus-icon-theme");
+            let _remove_epapirus = remove_epapirus_cmd.status().await
+                .context("apt-get remove epapirus-icon-theme").map_err(ReleaseError::Downgrade);
+        }
+        
+        // In Ubuntu 22.04, the `ansible` and `ansible-core` packages are not compatible.
+        // If `ansible-core` is downgradable, check if `ansible` is downgradable;
+        // if so, remove `ansible-core` and skip adding it to the downgrade command.
+        if package.contains("ansible-core") && version.contains("2.12") {
+            info!("ansible-core downgrade candidate version is from Ubuntu 22.04");
+            for (package, _version) in &downgradable {
+                if package.eq("ansible") {
+                    info!("ansible will also be downgraded, so removing ansible-core");
+                    let mut remove_ansible_core_cmd = AptGet::new().allow_downgrades().force().noninteractive();
+                        remove_ansible_core_cmd.arg("remove");
+                        remove_ansible_core_cmd.arg("ansible-core");
+                        let _remove_ansible_core = remove_ansible_core_cmd.status().await
+                            .context("apt-get remove ansible-core").map_err(ReleaseError::Downgrade);
+                    continue 'downgrades;
+                }
+            }
+            info!("ansible is not installed, so ansible-core will be downgraded");
         }
 
         if let Some(version) = version.split_ascii_whitespace().next() {
@@ -536,7 +564,7 @@ async fn update_package_lists() -> Result<(), ReleaseError> {
 /// Fetch apt packages and retry if network connections are changed.
 async fn fetch_current_updates(fetch: &dyn Fn(FetchEvent)) -> Result<(), ReleaseError> {
     let packages = Some(ExtraPackages::Static(CORE_PACKAGES));
-    let uris = crate::fetch::apt::fetch_uris(Shutdown::new(), packages)
+    let uris = crate::fetch::apt::fetch_uris(Shutdown::new(), packages, true)
         .await
         .map_err(ReleaseError::AptList)?;
 
@@ -577,7 +605,10 @@ async fn remove_conflicting_packages(logger: &dyn Fn(UpgradeEvent)) -> Result<()
     .map_err(ReleaseError::ConflictRemoval)?;
 
     // Add packages which have no remote to the conflict list
-    if let Ok(packages) = apt_cmd::apt::remoteless_packages().await {
+    if let Ok(mut packages) = apt_cmd::apt::remoteless_packages().await {
+        // Add exemptions for specific packages that we know to be safe.
+        packages.retain(|name| name != "sentinelagent");
+        // Add the packages that remain to our list of conflicting packages for removal.
         conflicting.extend_from_slice(&packages);
     }
 
@@ -613,17 +644,19 @@ fn terminate_background_applications() {
     };
 
     for proc in processes {
-        if let Ok(exe_path) = proc.exe() {
-            if let Some(exe) = exe_path.file_name() {
-                if let Some(mut exe) = exe.to_str() {
-                    if exe.ends_with(" (deleted)") {
-                        exe = &exe[..exe.len() - 10];
-                    }
+        if let Ok(proc) = proc {
+            if let Ok(exe_path) = proc.exe() {
+                if let Some(exe) = exe_path.file_name() {
+                    if let Some(mut exe) = exe.to_str() {
+                        if exe.ends_with(" (deleted)") {
+                            exe = &exe[..exe.len() - 10];
+                        }
 
-                    if exe == APPCENTER {
-                        eprintln!("killing {}", APPCENTER);
-                        unsafe {
-                            let _ = libc::kill(proc.pid(), libc::SIGKILL);
+                        if exe == APPCENTER {
+                            eprintln!("killing {}", APPCENTER);
+                            unsafe {
+                                let _ = libc::kill(proc.pid(), libc::SIGKILL);
+                            }
                         }
                     }
                 }
@@ -638,14 +671,31 @@ fn terminate_background_applications() {
 }
 
 async fn attempt_fetch<'a>(
-    shutdown: &Shutdown,
+    shutdown: &Shutdown<()>,
     logger: &'a dyn Fn(UpgradeEvent),
     fetch: &'a dyn Fn(FetchEvent),
 ) -> RelResult<()> {
-    info!("fetching packages for the new release");
+    info!("fetching updated packages for the new release");
     (*logger)(UpgradeEvent::FetchingPackagesForNewRelease);
 
-    let uris = crate::fetch::apt::fetch_uris(shutdown.clone(), None)
+    let uris = crate::fetch::apt::fetch_uris(shutdown.clone(), None, true)
+        .await
+        .map_err(ReleaseError::AptList)?;
+
+    apt_fetch(shutdown.clone(), uris, fetch).await
+}
+
+async fn additional_fetch<'a>(
+    shutdown: &Shutdown<()>,
+    logger: &'a dyn Fn(UpgradeEvent),
+    fetch: &'a dyn Fn(FetchEvent),
+    new_packages: &'static [&str],
+) -> RelResult<()> {
+    info!("fetching additional packages for the new release");
+    (*logger)(UpgradeEvent::FetchingAdditionalPackagesForNewRelease);
+
+    let packages = Some(ExtraPackages::Static(new_packages));
+    let uris = crate::fetch::apt::fetch_uris(shutdown.clone(), packages, false)
         .await
         .map_err(ReleaseError::AptList)?;
 
@@ -659,6 +709,7 @@ async fn fetch_new_release_packages<'b>(
     logger: &'b dyn Fn(UpgradeEvent),
     fetch: &'b dyn Fn(FetchEvent),
     current: &'b str,
+    to: &'b str,
 ) -> RelResult<()> {
     // Use a closure to capture any early returns due to an error.
     let updated_list_ops = || async {
@@ -668,6 +719,13 @@ async fn fetch_new_release_packages<'b>(
         AptGet::new().noninteractive().update().await.map_err(ReleaseError::ReleaseUpdate)?;
 
         attempt_fetch(&Shutdown::new(), logger, fetch).await?;
+
+        // If upgrading to 24.04, download an additional package.
+        if to == "24.04" {
+            //const NEW_PACKAGES &[&str] = &["gnome-online-accounts-gtk"];
+            //new_packages = Some(ExtraPackages::Static(NEW_PACKAGES));
+            additional_fetch(&Shutdown::new(), logger, fetch, &["gnome-online-accounts-gtk"]).await?;
+        }
 
         snapd::hold_transitional_packages().await?;
 

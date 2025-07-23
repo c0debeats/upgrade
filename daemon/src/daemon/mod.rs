@@ -48,7 +48,7 @@ use crate::{
     },
     sighandler, DBUS_IFACE, DBUS_NAME, DBUS_PATH, RESTART_SCHEDULED,
 };
-use async_shutdown::Shutdown;
+use async_shutdown::ShutdownManager as Shutdown;
 
 use anyhow::Context as AnyhowContext;
 use apt_cmd::{request::Request as AptRequest, AptCache, AptGet, AptMark};
@@ -85,18 +85,10 @@ pub const INSTALL_DATE: &str = "/usr/lib/pop-upgrade/install_date";
 
 #[derive(Debug)]
 pub enum Event {
-    FetchUpdates {
-        apt_uris:      HashSet<AptRequest>,
-        download_only: bool,
-    },
+    FetchUpdates { apt_uris: HashSet<AptRequest>, download_only: bool },
     PackageUpgrade,
     RecoveryUpgrade(RecoveryUpgradeMethod),
-    ReleaseUpgrade {
-        how:            ReleaseUpgradeMethod,
-        from:           String,
-        to:             String,
-        await_recovery: bool,
-    },
+    ReleaseUpgrade { how: ReleaseUpgradeMethod, from: String, to: String, await_recovery: bool },
 }
 
 #[derive(Debug)]
@@ -105,35 +97,55 @@ pub enum FgEvent {
 }
 
 pub struct LastKnown {
-    fetch:            Result<(), ReleaseError>,
+    development: bool,
+    fetch: Result<(), ReleaseError>,
     recovery_upgrade: Result<(), RecoveryError>,
-    release_upgrade:  Result<(), ReleaseError>,
+    release_upgrade: Result<(), ReleaseError>,
 }
 
 impl Default for LastKnown {
     fn default() -> Self {
-        Self { fetch: Ok(()), recovery_upgrade: Ok(()), release_upgrade: Ok(()) }
+        Self {
+            development: false,
+            fetch: Ok(()),
+            recovery_upgrade: Ok(()),
+            release_upgrade: Ok(()),
+        }
     }
 }
 
 pub struct ReleaseUpgradeState {
     action: release::UpgradeMethod,
-    from:   Box<str>,
-    to:     Box<str>,
+    from: Box<str>,
+    to: Box<str>,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct FetchState {
+    progress: u64,
+    total: u64,
+}
+
+impl FetchState {
+    pub const fn new(progress: u64, total: u64) -> Self {
+        Self { progress, total }
+    }
+}
+
+unsafe impl bytemuck::NoUninit for FetchState {}
 
 struct SharedState {
     // In case a UI is being constructed after a task has already started, it may request
     // for the curernt progress of a task.
-    fetching_state:        Atomic<(u64, u64)>,
+    fetching_state: Atomic<FetchState>,
     // The status of the event loop thread, which indicates the current task, or lack thereof.
-    status:                Atomic<DaemonStatus>,
+    status: Atomic<DaemonStatus>,
     // As well as the current sub-status, if relevant.
-    sub_status:            AtomicU8,
+    sub_status: AtomicU8,
     // Cancels a process that is currently active.
-    shutdown:              Mutex<Shutdown>,
+    shutdown: Mutex<Shutdown<()>>,
     // Development release
-    force_next:            AtomicBool,
+    force_next: AtomicBool,
     // Indicates that it is now uncancellable
     release_upgrade_began: AtomicBool,
 }
@@ -145,12 +157,12 @@ enum ReleaseCheck {
 }
 
 pub struct Daemon {
-    event_tx:        UnboundedSender<Event>,
-    last_known:      LastKnown,
+    event_tx: UnboundedSender<Event>,
+    last_known: LastKnown,
     perform_upgrade: bool,
-    release_check:   ReleaseCheck,
+    release_check: ReleaseCheck,
     release_upgrade: Option<ReleaseUpgradeState>,
-    shared_state:    Arc<SharedState>,
+    shared_state: Arc<SharedState>,
 }
 
 impl Daemon {
@@ -168,11 +180,11 @@ impl Daemon {
 
         // State shared between the background task thread, and the foreground DBus event loop.
         let shared_state = Arc::new(SharedState {
-            status:                Atomic::new(DaemonStatus::Inactive),
-            sub_status:            AtomicU8::new(0),
-            fetching_state:        Atomic::new((0, 0)),
-            shutdown:              Mutex::new(Shutdown::new()),
-            force_next:            AtomicBool::new(false),
+            status: Atomic::new(DaemonStatus::Inactive),
+            sub_status: AtomicU8::new(0),
+            fetching_state: Atomic::new(FetchState::new(0, 0)),
+            shutdown: Mutex::new(Shutdown::new()),
+            force_next: AtomicBool::new(false),
             release_upgrade_began: AtomicBool::new(false),
         });
 
@@ -194,8 +206,9 @@ impl Daemon {
                 let fetch_closure = enclose!((dbus_tx, shared_state) move |event| {
                     match event {
                         FetchEvent::Fetched(uri) => {
-                            let (current, npackages) = shared_state.fetching_state.load(Ordering::SeqCst);
-                            shared_state.fetching_state.store((current + 1, npackages), Ordering::SeqCst);
+                            let fetch_state = shared_state.fetching_state.load(Ordering::SeqCst);
+                            let (current, npackages) = (fetch_state.progress, fetch_state.total);
+                            shared_state.fetching_state.store(FetchState::new(current + 1, npackages), Ordering::SeqCst);
 
                             let _ = dbus_tx.send(SignalEvent::Fetched(
                                 uri.name,
@@ -207,7 +220,7 @@ impl Daemon {
                             let _ = dbus_tx.send(SignalEvent::Fetching(uri));
                         }
                         FetchEvent::Init(total) => {
-                            shared_state.fetching_state.store((0, total as u64), Ordering::SeqCst);
+                            shared_state.fetching_state.store(FetchState::new(0, total as u64), Ordering::SeqCst);
                         }
                         FetchEvent::Retrying(_uri) => (),
                     }
@@ -241,11 +254,11 @@ impl Daemon {
                             info!("fetching packages for {:?}", apt_uris);
 
                             let npackages = apt_uris.len() as u32;
-                            shared_state.fetching_state.store((0, u64::from(npackages)), Ordering::SeqCst);
+                            shared_state.fetching_state.store(FetchState::new(0, u64::from(npackages)), Ordering::SeqCst);
 
                             let result = crate::release::apt_fetch(shutdown.clone(), apt_uris, &fetch_closure).await;
 
-                            shared_state.fetching_state.store((0, 0), Ordering::SeqCst);
+                            shared_state.fetching_state.store(FetchState::new(0, 0), Ordering::SeqCst);
 
                             let result = match result {
                                 Ok(_) => {
@@ -300,6 +313,7 @@ impl Daemon {
 
                         Event::RecoveryUpgrade(action) => {
                             info!("attempting recovery upgrade with {:?}", action);
+
                             let result = recovery::recovery(
                                 shutdown.clone(),
                                 &action,
@@ -480,11 +494,11 @@ impl Daemon {
                             DaemonStatus::FetchingPackages,
                             move |daemon, already_active| {
                                 if already_active {
-                                    let (completed, total) =
+                                    let FetchState { progress, total } =
                                         daemon.shared_state.fetching_state.load(Ordering::SeqCst);
-                                    let completed = completed as u32;
+                                    let progress = progress as u32;
                                     let total = total as u32;
-                                    Ok((true, completed, total))
+                                    Ok((true, progress, total))
                                 } else {
                                     futures::executor::block_on(async move {
                                         daemon
@@ -610,6 +624,35 @@ impl Daemon {
                 ("development",),
                 ("current", "next", "build", "urgent", "is_lts"),
                 |_ctx: &mut Context, daemon: &mut Daemon, (development,): (bool,)| {
+                    if daemon.shared_state.release_upgrade_began.load(Ordering::SeqCst) {
+                        return Err(MethodErr::failed(
+                            "daemon is busy performing a release upgrade",
+                        ));
+                    }
+
+                    match daemon.shared_state.status.load(Ordering::SeqCst) {
+                        DaemonStatus::Inactive => (),
+                        DaemonStatus::PackageUpgrade => {
+                            return Err(MethodErr::failed("daemon is busy upgrading packages"))
+                        }
+                        DaemonStatus::ReleaseUpgrade => {
+                            return Err(MethodErr::failed(
+                                "daemon is busy performing a release upgrade",
+                            ))
+                        }
+                        DaemonStatus::RecoveryUpgrade => {
+                            return Err(MethodErr::failed(
+                                "daemon is busy upgrading the recovery partition",
+                            ))
+                        }
+                        DaemonStatus::FetchingPackages => {
+                            return Err(MethodErr::failed(
+                                "daemon is busy fetching package updates",
+                            ))
+                        }
+                    }
+
+                    daemon.last_known.development = development;
                     futures::executor::block_on(async {
                         daemon.shared_state.force_next.store(development, Ordering::SeqCst);
 
@@ -762,8 +805,10 @@ impl Daemon {
                 break Ok(());
             }
 
-            if let ReleaseCheck::NotFound = daemon.release_check {
-                shutdown_triggered = true;
+            if !daemon.last_known.development {
+                if let ReleaseCheck::NotFound = daemon.release_check {
+                    shutdown_triggered = true;
+                }
             }
 
             if daemon.perform_upgrade {
@@ -851,7 +896,7 @@ impl Daemon {
                             daemon
                                 .shared_state
                                 .fetching_state
-                                .store((progress, total), Ordering::SeqCst);
+                                .store(FetchState::new(progress, total), Ordering::SeqCst);
                             Self::signal_message(signals::RECOVERY_DOWNLOAD_PROGRESS)
                                 .append2(progress, total)
                         }
@@ -914,7 +959,7 @@ impl Daemon {
 
         use crate::fetch::apt::ExtraPackages;
         let packages = Some(ExtraPackages::Dynamic(extra_packages));
-        let apt_uris = crate::fetch::apt::fetch_uris(shutdown, packages).await?;
+        let apt_uris = crate::fetch::apt::fetch_uris(shutdown, packages, true).await?;
 
         if apt_uris.is_empty() {
             info!("no updates available to fetch");
@@ -948,7 +993,7 @@ impl Daemon {
 
         // Initiate shutdown of any background tasks.
         info!("sending shutdown signal");
-        shutdown.shutdown();
+        let _res = shutdown.trigger_shutdown(());
 
         // Wait for active tasks to complete before returning.
         info!("waiting for shutdown to complete");
@@ -978,8 +1023,8 @@ impl Daemon {
 
         let event = Event::RecoveryUpgrade(RecoveryUpgradeMethod::FromRelease {
             version: if version.is_empty() { None } else { Some(version.into()) },
-            arch:    if arch.is_empty() { None } else { Some(arch.into()) },
-            flags:   RecoveryReleaseFlags::from_bits_truncate(flags),
+            arch: if arch.is_empty() { None } else { Some(arch.into()) },
+            flags: RecoveryReleaseFlags::from_bits_truncate(flags),
         });
 
         self.submit_event(event)
@@ -1064,7 +1109,7 @@ impl Daemon {
 
         self.shared_state.status.store(DaemonStatus::Inactive, Ordering::SeqCst);
         self.shared_state.sub_status.store(0, Ordering::SeqCst);
-        self.shared_state.fetching_state.store((0, 0), Ordering::SeqCst);
+        self.shared_state.fetching_state.store(FetchState::new(0, 0), Ordering::SeqCst);
         self.release_upgrade = None;
 
         release::cleanup().await;
